@@ -9,11 +9,11 @@
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_RESET (-1)
+#define LORA_CS 18
+#define LORA_RST 14
 
 constexpr uint8_t BUTTON_PIN = 0;
-constexpr uint8_t LORA_CS = 18;
 constexpr uint8_t LORA_DIO0 = 26;
-constexpr uint8_t LORA_RST = 14;
 constexpr uint8_t LORA_DIO1 = 33;
 constexpr float LORA_FREQUENCY = 868.0;
 constexpr TickType_t DOUBLE_CLICK_WINDOW = pdMS_TO_TICKS(350);
