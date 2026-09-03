@@ -10,7 +10,7 @@
 #define OLED_SCL 22
 #define OLED_RESET (-1)
 #define LORA_CS 18
-#define LORA_RST 14
+#define LORA_RST 23
 
 constexpr uint8_t BUTTON_PIN = 0;
 constexpr uint8_t LORA_DIO0 = 26;
