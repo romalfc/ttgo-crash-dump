@@ -3,6 +3,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
+#include <esp_sleep.h>
+#include <driver/uart.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -23,9 +25,27 @@
 #define SINGLE_RADIO_PACKET_SIZE 32
 // Максимальна частка ефірного часу: після передачі радіо очікує 99 тривалостей TX.
 #define LORA_DUTY_CYCLE_PERCENT 1
+// Після цього часу без успішної передачі пристрій переходить у light sleep.
+#define DEVICE_IDLE_SLEEP_MS 60000
 
 constexpr char SINGLE_BUTTON_COMMAND[] = "singleBtn";
 constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
+
+// OLED-повідомлення та формати рядків зберігаються в одному місці.
+constexpr char OLED_READY_MESSAGE[] = "Button radio ready";
+constexpr char OLED_PACKET_STATUS_FORMAT[] = "%u byte packet %s";
+constexpr char OLED_TOTAL_SENT_FORMAT[] = "Total sent: %lu";
+constexpr char OLED_LAST_SLEEP_FORMAT[] = "Last sleep: %lu s";
+constexpr char OLED_TO_SLEEP_FORMAT[] = "To sleep: %lu s";
+constexpr char OLED_TRANSMISSION_TIME_FORMAT[] = "Time: %lu ms";
+constexpr char OLED_READY_TO_SEND_MESSAGE[] = "Ready to send";
+constexpr char OLED_DUTY_CYCLE_WAIT_MESSAGE[] = "Duty cycle wait";
+constexpr char OLED_NEXT_TX_FORMAT[] = "Next TX in: %lu ms";
+constexpr char OLED_HIBERNATION_MESSAGE[] = "Hibernation...";
+constexpr char OLED_STATUS_READY[] = "ready";
+constexpr char OLED_STATUS_SENDING[] = "sending...";
+constexpr char OLED_STATUS_SENT[] = "sent";
+constexpr char OLED_STATUS_FAILED[] = "failed";
 
 // Якщо друге натискання відбулося до цього порогу, формується doubleBtn;
 // після порогу натискання вважаються двома окремими singleBtn.
@@ -57,25 +77,46 @@ SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 QueueHandle_t buttonQueue;
 QueueHandle_t radioQueue;
 uint32_t sentPacketCount = 0;
+uint32_t lastSuccessfulPacketMs = 0;
+uint32_t wakeTimeMs = 0;
+uint32_t lastWorkingDisplayMs = 0;
+bool displayReady = false;
+volatile bool dutyCycleWaiting = false;
 
 // Показує на OLED поточний стан і розмір радіопакета.
+uint32_t getTimeToSleepMs() {
+  uint32_t idleTimeMs = millis() - lastSuccessfulPacketMs;
+  if (idleTimeMs >= DEVICE_IDLE_SLEEP_MS) {
+    return 0;
+  }
+  return DEVICE_IDLE_SLEEP_MS - idleTimeMs;
+}
+
 void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs = 0) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   if (packetSize > 0) {
-    display.printf("%u byte packet %s", static_cast<unsigned>(packetSize), status);
+    display.printf(OLED_PACKET_STATUS_FORMAT, static_cast<unsigned>(packetSize), status);
   } else {
-    display.println(F("Button radio ready"));
+    display.println(OLED_READY_MESSAGE);
   }
 
   display.setCursor(0, 16);
-  display.printf("Total sent: %lu", static_cast<unsigned long>(sentPacketCount));
+  display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
+
+  display.setCursor(0, 24);
+  display.printf(OLED_LAST_SLEEP_FORMAT,
+                static_cast<unsigned long>((millis() - wakeTimeMs) / 1000));
+
+  display.setCursor(0, 36);
+  display.printf(OLED_TO_SLEEP_FORMAT,
+                static_cast<unsigned long>(getTimeToSleepMs() / 1000));
 
   if (elapsedMs > 0) {
-    display.setCursor(0, 32);
-    display.printf("Time: %lu ms", static_cast<unsigned long>(elapsedMs));
+    display.setCursor(0, 48);
+    display.printf(OLED_TRANSMISSION_TIME_FORMAT, static_cast<unsigned long>(elapsedMs));
   }
 
   display.display();
@@ -87,14 +128,53 @@ void showDutyCycleCountdown(uint32_t remainingMs) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println(F("Duty cycle wait"));
+  if (remainingMs == 0) {
+    display.println(OLED_READY_TO_SEND_MESSAGE);
+  } else {
+    display.println(OLED_DUTY_CYCLE_WAIT_MESSAGE);
+  }
   display.setCursor(0, 16);
-  display.printf("Next TX in: %lu ms", static_cast<unsigned long>(remainingMs));
+  display.printf(OLED_NEXT_TX_FORMAT, static_cast<unsigned long>(remainingMs));
   display.setCursor(0, 32);
-  display.printf("Total sent: %lu", static_cast<unsigned long>(sentPacketCount));
+  display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
+  display.setCursor(0, 40);
+  display.printf(OLED_LAST_SLEEP_FORMAT,
+                static_cast<unsigned long>((millis() - wakeTimeMs) / 1000));
+  display.setCursor(0, 52);
+  display.printf(OLED_TO_SLEEP_FORMAT,
+                static_cast<unsigned long>(getTimeToSleepMs() / 1000));
   display.display();
 }
 
+// Переводити ESP32 у light sleep. UART0 пробуджує пристрій першим байтом команди.
+void enterIdleSleep() {
+  Serial.println(F("No packets for 60 seconds, entering light sleep."));
+  Serial.println(F("Send singleBtn or doubleBtn to wake the device."));
+
+  if (displayReady) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(16, 24);
+    display.println(OLED_HIBERNATION_MESSAGE);
+    display.display();
+  }
+
+  Serial.flush();
+
+  sentPacketCount = 0;
+  esp_sleep_enable_uart_wakeup(UART_NUM_0);
+  uart_set_wakeup_threshold(UART_NUM_0, 3);
+  esp_light_sleep_start();
+
+  wakeTimeMs = millis();
+  lastSuccessfulPacketMs = wakeTimeMs;
+  lastWorkingDisplayMs = wakeTimeMs;
+  Serial.println(F("Device woke up from light sleep."));
+  if (displayReady) {
+    showRadioStatus(0, OLED_STATUS_READY);
+  }
+}
 // Задача опитує кнопку, усуває дребезг і розрізняє одинарне/подвійне натискання.
 void buttonTask(void *parameter) {
   (void)parameter;
@@ -175,8 +255,10 @@ void radioTask(void *parameter) {
     uint32_t transmissionTime = millis() - transmissionStart;
     if (sendStatus == RADIOLIB_ERR_NONE) {
       ++sentPacketCount;
+      lastSuccessfulPacketMs = millis();
     }
-    showRadioStatus(packetSize, sendStatus == RADIOLIB_ERR_NONE ? "sent" : "failed",
+    showRadioStatus(packetSize,
+            sendStatus == RADIOLIB_ERR_NONE ? OLED_STATUS_SENT : OLED_STATUS_FAILED,
                     transmissionTime);
     Serial.printf("Radio task: sent \"%s\", size=%d bytes, result=%d\n",
             packet.text,
@@ -187,6 +269,7 @@ void radioTask(void *parameter) {
     uint32_t quietTimeMs = transmissionTime *
         (100 - LORA_DUTY_CYCLE_PERCENT) / LORA_DUTY_CYCLE_PERCENT;
     if (quietTimeMs > 0) {
+      dutyCycleWaiting = true;
       Serial.printf("Radio task: duty-cycle wait %lu ms\n",
                     static_cast<unsigned long>(quietTimeMs));
       uint32_t waitStart = millis();
@@ -206,6 +289,7 @@ void radioTask(void *parameter) {
 
       showDutyCycleCountdown(0);
       Serial.println(F("Radio task: next TX allowed"));
+      dutyCycleWaiting = false;
     }
   }
 }
@@ -214,6 +298,8 @@ void radioTask(void *parameter) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  wakeTimeMs = millis();
+  lastSuccessfulPacketMs = wakeTimeMs;
   Serial.println(F("Button -> Queue -> Main Loop -> Radio Task"));
   // Приклади: singleBtn; doubleBtn; doubleBtn 1000, потім Enter.
   // doubleBtn без аргументу імітує double, а аргумент задає інтервал між натисканнями.
@@ -233,7 +319,8 @@ void setup() {
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    showRadioStatus(0, "ready");
+    displayReady = true;
+    showRadioStatus(0, OLED_STATUS_READY);
   }
 
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 4096, nullptr, 1, nullptr, 1);
@@ -306,6 +393,19 @@ void processSerialCommands() {
 void loop() {
   processSerialCommands();
 
+  if (uxQueueMessagesWaiting(radioQueue) == 0 &&
+      millis() - lastSuccessfulPacketMs >= DEVICE_IDLE_SLEEP_MS) {
+    enterIdleSleep();
+    return;
+  }
+
+    if (displayReady && !dutyCycleWaiting &&
+      millis() - lastWorkingDisplayMs >= 1000 &&
+      uxQueueMessagesWaiting(radioQueue) == 0) {
+      showRadioStatus(0, OLED_STATUS_READY);
+    lastWorkingDisplayMs = millis();
+  }
+
   ButtonPress press;
   if (xQueueReceive(buttonQueue, &press, pdMS_TO_TICKS(20)) != pdTRUE) {
     return;
@@ -322,7 +422,7 @@ void loop() {
   size_t packetSize = press == ButtonPress::Single
       ? SINGLE_RADIO_PACKET_SIZE
       : RADIO_PACKET_SIZE;
-  showRadioStatus(packetSize, "sending...");
+  showRadioStatus(packetSize, OLED_STATUS_SENDING);
   Serial.printf("Main loop: %s\n", packet.text);
   xQueueSend(radioQueue, &packet, portMAX_DELAY);
 }
