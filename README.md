@@ -122,7 +122,7 @@ pio device monitor --environment ttgo-lora32-v2 --port COM6
 
 Також можна використовувати кнопки PlatformIO: **Build**, **Upload** і **Monitor**.
 
-## Залежності
+##  Залежності
 
 Залежності визначені у [platformio.ini](platformio.ini):
 
