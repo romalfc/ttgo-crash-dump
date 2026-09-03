@@ -18,10 +18,16 @@ constexpr uint8_t BUTTON_PIN = 0;
 constexpr uint8_t LORA_DIO0 = 26;
 constexpr uint8_t LORA_DIO1 = 33;
 constexpr float LORA_FREQUENCY = 868.0;
+constexpr char SINGLE_BUTTON_COMMAND[] = "singleBtn";
+constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
 
-// Часові параметри фільтрації дребезгу і подвійного натискання.
-constexpr TickType_t DOUBLE_CLICK_WINDOW = pdMS_TO_TICKS(350);
+// Якщо друге натискання відбулося до цього порогу, формується doubleBtn;
+// після порогу натискання вважаються двома окремими singleBtn.
+#define DOUBLE_CLICK_THRESHOLD_MS 350
+
+// Час debounce сталий, а поріг подвійного натискання можна змінити через Serial.
 constexpr TickType_t BUTTON_DEBOUNCE = pdMS_TO_TICKS(40);
+volatile uint32_t doubleClickWindowMs = DOUBLE_CLICK_THRESHOLD_MS;
 
 enum class ButtonPress : uint8_t {
   Single,
@@ -58,7 +64,7 @@ void buttonTask(void *parameter) {
 
         if (digitalRead(BUTTON_PIN) == HIGH) {
           TickType_t releaseTime = xTaskGetTickCount();
-          while (xTaskGetTickCount() - releaseTime < DOUBLE_CLICK_WINDOW) {
+          while (xTaskGetTickCount() - releaseTime < pdMS_TO_TICKS(doubleClickWindowMs)) {
             if (digitalRead(BUTTON_PIN) == LOW) {
               vTaskDelay(BUTTON_DEBOUNCE);
               if (digitalRead(BUTTON_PIN) == LOW) {
@@ -118,6 +124,10 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println(F("Button -> Queue -> Main Loop -> Radio Task"));
+  // Приклади: singleBtn; doubleBtn; doubleBtn 500, потім Enter.
+  // doubleBtn без аргументу імітує подвійне натискання.
+  Serial.printf("Serial commands: %s, %s [100..2000]\n",
+                SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   buttonQueue = xQueueCreate(5, sizeof(ButtonPress));
@@ -144,10 +154,64 @@ void setup() {
   xTaskCreatePinnedToCore(radioTask, "RadioTask", 4096, nullptr, 1, nullptr, 0);
 }
 
+// Обробляє команди з Serial Monitor і передає їх у ту саму чергу, що й кнопка.
+void processSerialCommands() {
+  static char command[16];
+  static uint8_t commandLength = 0;
+
+  while (Serial.available() > 0) {
+    char character = static_cast<char>(Serial.read());
+
+    if (character == '\r') {
+      continue;
+    }
+
+    if (character == '\n') {
+      command[commandLength] = '\0';
+
+      unsigned long requestedWindowMs = 0;
+
+      if (strcmp(command, SINGLE_BUTTON_COMMAND) == 0) {
+        ButtonPress press = ButtonPress::Single;
+        xQueueSend(buttonQueue, &press, 0);
+        Serial.println(F("Serial: simulated single press"));
+      } else if (strcmp(command, DOUBLE_BUTTON_COMMAND) == 0) {
+        ButtonPress press = ButtonPress::Double;
+        xQueueSend(buttonQueue, &press, 0);
+        Serial.println(F("Serial: simulated double press"));
+      } else if (strncmp(command, DOUBLE_BUTTON_COMMAND,
+                         strlen(DOUBLE_BUTTON_COMMAND)) == 0 &&
+                 command[strlen(DOUBLE_BUTTON_COMMAND)] == ' ' &&
+                 sscanf(command + strlen(DOUBLE_BUTTON_COMMAND) + 1,
+                        "%lu", &requestedWindowMs) == 1) {
+        if (requestedWindowMs >= 100 && requestedWindowMs <= 2000) {
+          doubleClickWindowMs = requestedWindowMs;
+          Serial.printf("Serial: double-click window=%lu ms\n", doubleClickWindowMs);
+        } else {
+          Serial.println(F("doubleBtn must be between 100 and 2000 ms"));
+        }
+      } else if (commandLength > 0) {
+        Serial.printf("Use %s, %s, or %s 100..2000\n",
+                      SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND,
+                      DOUBLE_BUTTON_COMMAND);
+      }
+
+      commandLength = 0;
+      continue;
+    }
+
+    if (commandLength < sizeof(command) - 1) {
+      command[commandLength++] = character;
+    }
+  }
+}
+
 // Головний цикл отримує тип натискання та формує відповідний радіопакет.
 void loop() {
+  processSerialCommands();
+
   ButtonPress press;
-  if (xQueueReceive(buttonQueue, &press, portMAX_DELAY) != pdTRUE) {
+  if (xQueueReceive(buttonQueue, &press, pdMS_TO_TICKS(20)) != pdTRUE) {
     return;
   }
 
