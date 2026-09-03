@@ -16,6 +16,8 @@ constexpr uint8_t BUTTON_PIN = 0;
 constexpr uint8_t LORA_DIO0 = 26;
 constexpr uint8_t LORA_DIO1 = 33;
 constexpr float LORA_FREQUENCY = 868.0;
+
+// Часові параметри фільтрації дребезгу і подвійного натискання.
 constexpr TickType_t DOUBLE_CLICK_WINDOW = pdMS_TO_TICKS(350);
 constexpr TickType_t BUTTON_DEBOUNCE = pdMS_TO_TICKS(40);
 
@@ -34,6 +36,7 @@ SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 QueueHandle_t buttonQueue;
 QueueHandle_t radioQueue;
 
+// Задача опитує кнопку, усуває дребезг і розрізняє одинарне/подвійне натискання.
 void buttonTask(void *parameter) {
   (void)parameter;
   bool previousState = digitalRead(BUTTON_PIN);
@@ -77,6 +80,7 @@ void buttonTask(void *parameter) {
   }
 }
 
+// Задача ініціалізує SX1276 і відправляє пакети з radioQueue через LoRa.
 void radioTask(void *parameter) {
   (void)parameter;
   int16_t status = radio.begin(LORA_FREQUENCY);
@@ -102,6 +106,7 @@ void radioTask(void *parameter) {
   }
 }
 
+// Головна функція ініціалізує дисплей, створює черги та запускає задачі.
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -132,6 +137,7 @@ void setup() {
   xTaskCreatePinnedToCore(radioTask, "RadioTask", 4096, nullptr, 1, nullptr, 0);
 }
 
+// Головний цикл отримує тип натискання та формує відповідний радіопакет.
 void loop() {
   ButtonPress press;
   if (xQueueReceive(buttonQueue, &press, portMAX_DELAY) != pdTRUE) {
