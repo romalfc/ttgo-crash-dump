@@ -81,6 +81,20 @@ void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs =
   display.display();
 }
 
+// Показує час, який залишився до дозволеної наступної передачі.
+void showDutyCycleCountdown(uint32_t remainingMs) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Duty cycle wait"));
+  display.setCursor(0, 16);
+  display.printf("Next TX in: %lu ms", static_cast<unsigned long>(remainingMs));
+  display.setCursor(0, 32);
+  display.printf("Total sent: %lu", static_cast<unsigned long>(sentPacketCount));
+  display.display();
+}
+
 // Задача опитує кнопку, усуває дребезг і розрізняє одинарне/подвійне натискання.
 void buttonTask(void *parameter) {
   (void)parameter;
@@ -175,7 +189,23 @@ void radioTask(void *parameter) {
     if (quietTimeMs > 0) {
       Serial.printf("Radio task: duty-cycle wait %lu ms\n",
                     static_cast<unsigned long>(quietTimeMs));
-      vTaskDelay(pdMS_TO_TICKS(quietTimeMs));
+      uint32_t waitStart = millis();
+      uint32_t nextStatusUpdate = waitStart;
+      uint32_t waitEnd = waitStart + quietTimeMs;
+
+      while (static_cast<int32_t>(waitEnd - millis()) > 0) {
+        uint32_t remainingMs = waitEnd - millis();
+        if (static_cast<int32_t>(millis() - nextStatusUpdate) >= 0) {
+          showDutyCycleCountdown(remainingMs);
+          Serial.printf("Radio task: next TX in %lu ms\n",
+                        static_cast<unsigned long>(remainingMs));
+          nextStatusUpdate = millis() + 250;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+      }
+
+      showDutyCycleCountdown(0);
+      Serial.println(F("Radio task: next TX allowed"));
     }
   }
 }
