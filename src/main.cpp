@@ -11,6 +11,8 @@
 #define OLED_RESET (-1)
 #define LORA_CS 18
 #define LORA_RST 23
+// Потужність TX у dBm: можливі приклади 2, 5, 10, 14 або 17; максимум залежить від модуля та норм регіону.
+#define LORA_TX_POWER 2
 
 constexpr uint8_t BUTTON_PIN = 0;
 constexpr uint8_t LORA_DIO0 = 26;
@@ -85,7 +87,12 @@ void radioTask(void *parameter) {
   (void)parameter;
   int16_t status = radio.begin(LORA_FREQUENCY);
   if (status == RADIOLIB_ERR_NONE) {
-    Serial.println(F("Radio task: SX1276 ready"));
+    int16_t powerStatus = radio.setOutputPower(LORA_TX_POWER);
+    if (powerStatus == RADIOLIB_ERR_NONE) {
+      Serial.printf("Radio task: SX1276 ready, TX power=%d dBm\n", LORA_TX_POWER);
+    } else {
+      Serial.printf("Radio task: TX power setup failed, code %d\n", powerStatus);
+    }
   } else {
     Serial.printf("Radio task: init failed, code %d\n", status);
   }
