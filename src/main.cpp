@@ -19,6 +19,10 @@
 #define LORA_TX_POWER 2
 #define LORA_FREQUENCY 868.0
 #define LORA_BUTTON_PIN 0
+#define RADIO_PACKET_SIZE 64
+#define SINGLE_RADIO_PACKET_SIZE 32
+// Максимальна частка ефірного часу: після передачі радіо очікує 99 тривалостей TX.
+#define LORA_DUTY_CYCLE_PERCENT 1
 
 constexpr char SINGLE_BUTTON_COMMAND[] = "singleBtn";
 constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
@@ -38,13 +42,44 @@ enum class ButtonPress : uint8_t {
 
 struct RadioPacket {
   ButtonPress type;
-  char text[32];
+  char text[RADIO_PACKET_SIZE - sizeof(ButtonPress)];
 };
+
+static_assert(sizeof(RadioPacket) == RADIO_PACKET_SIZE,
+              "RadioPacket must be exactly 64 bytes");
+static_assert(SINGLE_RADIO_PACKET_SIZE < RADIO_PACKET_SIZE,
+              "Single packet must be smaller than double packet");
+static_assert(LORA_DUTY_CYCLE_PERCENT > 0 && LORA_DUTY_CYCLE_PERCENT <= 100,
+              "LORA_DUTY_CYCLE_PERCENT must be between 1 and 100");
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 QueueHandle_t buttonQueue;
 QueueHandle_t radioQueue;
+uint32_t sentPacketCount = 0;
+
+// Показує на OLED поточний стан і розмір радіопакета.
+void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs = 0) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  if (packetSize > 0) {
+    display.printf("%u byte packet %s", static_cast<unsigned>(packetSize), status);
+  } else {
+    display.println(F("Button radio ready"));
+  }
+
+  display.setCursor(0, 16);
+  display.printf("Total sent: %lu", static_cast<unsigned long>(sentPacketCount));
+
+  if (elapsedMs > 0) {
+    display.setCursor(0, 32);
+    display.printf("Time: %lu ms", static_cast<unsigned long>(elapsedMs));
+  }
+
+  display.display();
+}
 
 // Задача опитує кнопку, усуває дребезг і розрізняє одинарне/подвійне натискання.
 void buttonTask(void *parameter) {
@@ -116,8 +151,32 @@ void radioTask(void *parameter) {
       continue;
     }
 
-    int16_t sendStatus = radio.transmit(packet.text);
-    Serial.printf("Radio task: sent \"%s\", result=%d\n", packet.text, sendStatus);
+    size_t packetSize = packet.type == ButtonPress::Single
+        ? SINGLE_RADIO_PACKET_SIZE
+        : RADIO_PACKET_SIZE;
+    uint32_t transmissionStart = millis();
+    int16_t sendStatus = radio.transmit(
+      reinterpret_cast<const uint8_t *>(&packet),
+        packetSize);
+    uint32_t transmissionTime = millis() - transmissionStart;
+    if (sendStatus == RADIOLIB_ERR_NONE) {
+      ++sentPacketCount;
+    }
+    showRadioStatus(packetSize, sendStatus == RADIOLIB_ERR_NONE ? "sent" : "failed",
+                    transmissionTime);
+    Serial.printf("Radio task: sent \"%s\", size=%d bytes, result=%d\n",
+            packet.text,
+            packetSize,
+            sendStatus);
+
+    // Для duty cycle 1% пауза становить 99 тривалостей попередньої передачі.
+    uint32_t quietTimeMs = transmissionTime *
+        (100 - LORA_DUTY_CYCLE_PERCENT) / LORA_DUTY_CYCLE_PERCENT;
+    if (quietTimeMs > 0) {
+      Serial.printf("Radio task: duty-cycle wait %lu ms\n",
+                    static_cast<unsigned long>(quietTimeMs));
+      vTaskDelay(pdMS_TO_TICKS(quietTimeMs));
+    }
   }
 }
 
@@ -126,8 +185,8 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println(F("Button -> Queue -> Main Loop -> Radio Task"));
-  // Приклади: singleBtn; doubleBtn; doubleBtn 500, потім Enter.
-  // doubleBtn без аргументу імітує подвійне натискання.
+  // Приклади: singleBtn; doubleBtn; doubleBtn 1000, потім Enter.
+  // doubleBtn без аргументу імітує double, а аргумент задає інтервал між натисканнями.
   Serial.printf("Serial commands: %s, %s [100..2000]\n",
                 SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND);
 
@@ -144,12 +203,7 @@ void setup() {
 
   Wire.begin(OLED_SDA, OLED_SCL);
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println(F("Button radio ready"));
-    display.display();
+    showRadioStatus(0, "ready");
   }
 
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 4096, nullptr, 1, nullptr, 1);
@@ -187,8 +241,18 @@ void processSerialCommands() {
                  sscanf(command + strlen(DOUBLE_BUTTON_COMMAND) + 1,
                         "%lu", &requestedWindowMs) == 1) {
         if (requestedWindowMs >= 100 && requestedWindowMs <= 2000) {
-          doubleClickWindowMs = requestedWindowMs;
-          Serial.printf("Serial: double-click window=%lu ms\n", doubleClickWindowMs);
+          if (requestedWindowMs > doubleClickWindowMs) {
+            ButtonPress singlePress = ButtonPress::Single;
+            xQueueSend(buttonQueue, &singlePress, 0);
+            xQueueSend(buttonQueue, &singlePress, 0);
+            Serial.printf("Serial: %lu ms > %lu ms, queued two single presses\n",
+                          requestedWindowMs, doubleClickWindowMs);
+          } else {
+            ButtonPress doublePress = ButtonPress::Double;
+            xQueueSend(buttonQueue, &doublePress, 0);
+            Serial.printf("Serial: %lu ms <= %lu ms, queued one double press\n",
+                          requestedWindowMs, doubleClickWindowMs);
+          }
         } else {
           Serial.println(F("doubleBtn must be between 100 and 2000 ms"));
         }
@@ -217,7 +281,7 @@ void loop() {
     return;
   }
 
-  RadioPacket packet;
+  RadioPacket packet{};
   packet.type = press;
   const char *message = press == ButtonPress::Single
       ? "BUTTON SINGLE"
@@ -225,6 +289,10 @@ void loop() {
   strncpy(packet.text, message, sizeof(packet.text) - 1);
   packet.text[sizeof(packet.text) - 1] = '\0';
 
+  size_t packetSize = press == ButtonPress::Single
+      ? SINGLE_RADIO_PACKET_SIZE
+      : RADIO_PACKET_SIZE;
+  showRadioStatus(packetSize, "sending...");
   Serial.printf("Main loop: %s\n", packet.text);
   xQueueSend(radioQueue, &packet, portMAX_DELAY);
 }
