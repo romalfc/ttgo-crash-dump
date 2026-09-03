@@ -9,15 +9,17 @@
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_RESET (-1)
+
+// Апаратна конфігурація LoRa-модуля, яку можна перевизначити для іншої плати.
 #define LORA_CS 18
+#define LORA_DIO0 26
+#define LORA_DIO1 33
 #define LORA_RST 23
 // Потужність TX у dBm: можливі приклади 2, 5, 10, 14 або 17; максимум залежить від модуля та норм регіону.
 #define LORA_TX_POWER 2
+#define LORA_FREQUENCY 868.0
+#define LORA_BUTTON_PIN 0
 
-constexpr uint8_t BUTTON_PIN = 0;
-constexpr uint8_t LORA_DIO0 = 26;
-constexpr uint8_t LORA_DIO1 = 33;
-constexpr float LORA_FREQUENCY = 868.0;
 constexpr char SINGLE_BUTTON_COMMAND[] = "singleBtn";
 constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
 
@@ -27,7 +29,7 @@ constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
 
 // Час debounce сталий, а поріг подвійного натискання можна змінити через Serial.
 constexpr TickType_t BUTTON_DEBOUNCE = pdMS_TO_TICKS(40);
-volatile uint32_t doubleClickWindowMs = DOUBLE_CLICK_THRESHOLD_MS;
+uint32_t doubleClickWindowMs = DOUBLE_CLICK_THRESHOLD_MS;
 
 enum class ButtonPress : uint8_t {
   Single,
@@ -47,29 +49,29 @@ QueueHandle_t radioQueue;
 // Задача опитує кнопку, усуває дребезг і розрізняє одинарне/подвійне натискання.
 void buttonTask(void *parameter) {
   (void)parameter;
-  bool previousState = digitalRead(BUTTON_PIN);
+  bool previousState = digitalRead(LORA_BUTTON_PIN);
 
   for (;;) {
-    bool currentState = digitalRead(BUTTON_PIN);
+    bool currentState = digitalRead(LORA_BUTTON_PIN);
 
     if (previousState == HIGH && currentState == LOW) {
       vTaskDelay(BUTTON_DEBOUNCE);
-      if (digitalRead(BUTTON_PIN) == LOW) {
-        while (digitalRead(BUTTON_PIN) == LOW) {
+      if (digitalRead(LORA_BUTTON_PIN) == LOW) {
+        while (digitalRead(LORA_BUTTON_PIN) == LOW) {
           vTaskDelay(pdMS_TO_TICKS(10));
         }
 
         vTaskDelay(BUTTON_DEBOUNCE);
         ButtonPress press = ButtonPress::Single;
 
-        if (digitalRead(BUTTON_PIN) == HIGH) {
+        if (digitalRead(LORA_BUTTON_PIN) == HIGH) {
           TickType_t releaseTime = xTaskGetTickCount();
           while (xTaskGetTickCount() - releaseTime < pdMS_TO_TICKS(doubleClickWindowMs)) {
-            if (digitalRead(BUTTON_PIN) == LOW) {
+            if (digitalRead(LORA_BUTTON_PIN) == LOW) {
               vTaskDelay(BUTTON_DEBOUNCE);
-              if (digitalRead(BUTTON_PIN) == LOW) {
+              if (digitalRead(LORA_BUTTON_PIN) == LOW) {
                 press = ButtonPress::Double;
-                while (digitalRead(BUTTON_PIN) == LOW) {
+                while (digitalRead(LORA_BUTTON_PIN) == LOW) {
                   vTaskDelay(pdMS_TO_TICKS(10));
                 }
                 break;
@@ -129,7 +131,7 @@ void setup() {
   Serial.printf("Serial commands: %s, %s [100..2000]\n",
                 SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LORA_BUTTON_PIN, INPUT_PULLUP);
   buttonQueue = xQueueCreate(5, sizeof(ButtonPress));
   radioQueue = xQueueCreate(5, sizeof(RadioPacket));
 
